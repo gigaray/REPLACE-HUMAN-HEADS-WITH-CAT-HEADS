@@ -31,6 +31,8 @@ def main():
             # Capture live frame
             frame = cam0.picam.capture_array("main")
 
+            frame = cv.cvtColor(frame, cv.COLOR_RGB2BGR)
+            
             # Paste cat on the frame
             frame = cat_paste(frame, cat, POS_X, POS_Y)
 
