@@ -12,7 +12,7 @@ def main():
     print("Commands: [S]: Take shot, [Q]: Quit, [L]: List files\n")
     
     cam0 = CameraController(0, False)
-    cam0.start_preview()
+    #cam0.start_preview()
     
     # ---- YOU control these ----
     POS_X = 200   # change this later
