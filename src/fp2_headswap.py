@@ -15,10 +15,13 @@ from picamera2 import Picamera2
 from picamera2.encoders import H264Encoder
 from PIL import Image, ImageTk
 import cv2
+import numpy as np
+from collections import Counter
 
-print(cv2.__version__)
+print(f"OpenCV: {cv2.__version__}")
+# print(f"Picamera2: {Picamera2.__version__}")
+print(f"np: {np.__version__}")
 print(cv2.__file__)
-
 
 # ========================================
 # CONFIGURATION CONSTANTS
@@ -297,6 +300,137 @@ def stop_recording():
     
     threading.Thread(target=_stop, daemon=True).start()
 
+# ========================================
+# HEAD SWAP HELPER FUNCTIONS
+# ========================================
+
+# using histogram - simpler anything but less accurate
+def get_dominant_color_simple(frame):
+    # Reshape to list of pixels
+    pixels = frame.reshape(-1, 3)
+    
+    # Convert to tuples for counting
+    pixels_tuple = [tuple(pixel) for pixel in pixels]
+    
+    # Count occurrences
+    most_common = Counter(pixels_tuple).most_common(1)[0][0]
+    
+    return np.array(most_common)
+
+# using K-means clustering - more accurate
+# inspired by https://stackoverflow.com/questions/3241929/python-find-dominant-most-common-color-in-an-image
+
+def get_dominant_color_kmeans(frame, k=3):
+    """
+    Returns the dominant color in an image using K-Means clustering.
+
+    Parameters:
+        frame (np.ndarray): Input image (H x W x 3).
+        k (int): Number of clusters for K-Means.
+
+    Returns:
+        np.ndarray: Dominant color as an integer BGR array.
+    """
+    # Convert the image into a 2D array of pixels
+    pixels = frame.reshape(-1, 3).astype(np.float32)
+
+    # Run K-Means on the pixel data
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+    _, labels, centers = cv2.kmeans(
+        data=pixels,
+        K=k,
+        bestLabels=None,
+        criteria=criteria,
+        attempts=10,
+        flags=cv2.KMEANS_RANDOM_CENTERS,
+    )
+
+    # Count how many pixels belong to each cluster
+    counts = Counter(labels.flatten())
+
+    # The cluster with the largest count represents the dominant color
+    dominant_index = counts.most_common(1)[0][0]
+    dominant_color = centers[dominant_index]
+
+    return dominant_color.astype(int)
+
+# portions from https://stackoverflow.com/questions/55691212/extract-upper-body-from-face-detection-opencv-python
+
+def get_upper_body_region(frame, face_rect):
+    """
+    Given a detected face rectangle (x, y, w, h), estimate and extract
+    the region of the upper body directly below the face.
+    """
+    x, y, w, h = face_rect
+    frame_h, frame_w = frame.shape[:2]
+
+    # The upper body starts just below the chin
+    top = y + h
+
+    # these hacks ratio are based on average human proportions
+    # https://en.wikipedia.org/wiki/Body_proportions
+    
+    # Rough estimate: the upper torso is about 1.5 times the face height
+    body_height = int(h * 1.5)
+
+    # Shoulders are wider than the face, so expand the width
+    body_width = int(w * 1.8)
+    left = max(0, x - int(w * 0.4))
+
+    # Keep everything inside the frame boundaries
+    bottom = min(frame_h, top + body_height)
+    right = min(frame_w, left + body_width)
+
+    # Crop and return the upper-body region
+    region = frame[top:bottom, left:right]
+
+    return region, (left, top, right - left, bottom - top)
+
+
+# portions from https://stackoverflow.com/questions/61241113/detect-skin-color-in-an-image-using-opencv-python
+# and https://stackoverflow.com/questions/3514158/how-to-detect-skin-in-an-image
+
+def is_skin_color(pixel_bgr):
+    """
+    Returns True if a given BGR pixel is likely to be skin.
+    Uses simple RGB heuristics to filter out skin tones so that
+    clothing colors can be isolated.
+    """
+    b, g, r = pixel_bgr
+
+    # Basic skin-tone rules in RGB space
+    if (
+        r > 95 and g > 40 and b > 20 and
+        (max(r, g, b) - min(r, g, b)) > 15 and
+        abs(r - g) > 15 and
+        r > g and r > b
+    ):
+        return True
+
+    return False
+
+
+# Kender et al (1996). paper title "Finding Skin in Color Images."
+# Proceedings of the 2nd International Conference on Automatic Face and Gesture Recognition
+# portions from https://stackoverflow.com/questions/61241113/detect-skin-color-in-an-image-using-opencv-python
+
+def filter_skin_pixels(region):
+    """
+    Returns all pixels in the region that are *not* classified as skin.
+    Useful for isolating clothing colors.
+    """
+    pixels = region.reshape(-1, 3)
+
+    # Build a mask that keeps only non-skin pixels
+    mask = []
+    for pixel in pixels:
+        mask.append(not is_skin_color(pixel))
+
+    mask = np.array(mask)
+    filtered = pixels[mask]
+
+    return filtered
+
 
 # ========================================
 # HEAD SWAP FUNCTIONS
@@ -360,6 +494,27 @@ def start_head_swap():
             for i, (x, y, w, h) in enumerate(faces):
                 print(f"   Face {i+1}: x={x}, y={y}, w={w}, h={h}")
                 cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                
+                # hack the upper body region for dominant clothing color
+                upper_body_region, region_coords = get_upper_body_region(frame, (x, y, w, h))
+                if upper_body_region.size == 0:
+                    print(f"   Face {i+1}: Upper body region is empty")
+                    return None
+    
+                # Filter out skin pixels
+                filtered_pixels = filter_skin_pixels(upper_body_region)
+                if filtered_pixels.size > 0:
+                    dominant_color = get_dominant_color_kmeans(filtered_pixels.reshape(-1, 1, 3), k=3)
+                    print(f"   Face {i+1}: Dominant clothing color: {dominant_color}")
+                    x2, y2, w2, h2 = region_coords
+                    cv2.rectangle(frame, (x2, y2), (x2+w2, y2+h2), (0, 255, 0), 2)
+                else:
+                    print(f"   Face {i+1}: No non-skin pixels found in upper body region")  
+                    dominant_color = get_dominant_color_kmeans(upper_body_region, k=3)
+                    print(f"   Face {i+1}: Dominant clothing color (unfiltered): {dominant_color}") 
+                    x2, y2, w2, h2 = region_coords
+                    cv2.rectangle(frame, (x2, y2), (x2+w2, y2+h2), (128, 0, 255), 2)
+                    
         else:
             if frame_count % 30 == 0:
                 print(f"Frame {frame_count}: No faces detected")
